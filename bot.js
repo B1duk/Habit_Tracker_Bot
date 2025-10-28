@@ -6,12 +6,57 @@ const bot = new Telegraf(BOT_TOKEN);
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY // или SERVICE_ROLE_KEY (осторожно!)
+  process.env.SUPABASE_ANON_KEY 
 );
 
 const userStates={};
 const userHabits = {};
+async function sendHabitsList(ctx) {
+  const userId = ctx.from.id.toString();
 
+  const { data: habits, error: habitsError } = await supabase
+    .from('habits')
+    .select('id, title')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true });
+
+  if (habitsError || !habits?.length) {
+    return ctx.reply('У вас пока нет привычек.');
+  }
+
+  const habitIds = habits.map(h => h.id);
+  const { data: records, error: recordsError } = await supabase
+    .from('habit_records') 
+    .select('habit_id, record_date')
+    .in('habit_id', habitIds);
+
+  if (recordsError) {
+    console.error('Ошибка загрузки записей:', recordsError);
+    return ctx.reply('❌ Не удалось загрузить данные.');
+  }
+
+
+  const recordsByHabit = {};
+  records.forEach(r => {
+    if (!recordsByHabit[r.habit_id]) recordsByHabit[r.habit_id] = [];
+    recordsByHabit[r.habit_id].push(r.record_date);
+  });
+
+  const inlineKeyboard = habits.map(habit => {
+    const dates = recordsByHabit[habit.id] || [];
+    const streak = calculateStreak(dates);
+    const streakText = streak > 0 ? ` 🔥${streak}` : '';
+
+    return [
+      { text: `${habit.title}${streakText}`, callback_data: `view_${habit.id}` },
+      { text: "✅ Отметить", callback_data: `mark_${habit.id}` }
+    ];
+  });
+
+  await ctx.reply('Ваши привычки:', {
+    reply_markup: { inline_keyboard: inlineKeyboard }
+  });
+}
 bot.start((ctx) =>{
     const userId = ctx.from.id.toString();
      console.log(`[🚀] Пользователь  (ID: ${userId}) запустил бота.`);
@@ -41,42 +86,29 @@ bot.hears('Добавить привычку', ctx=>{
 
 
 
-bot.hears('Список привычек', async (ctx) => {
-  const userId = ctx.from.id.toString();
-  console.log("🔍 Запрашиваем user_id (строка):", JSON.stringify(userId));
+function calculateStreak(recordDates) {
+  if (!recordDates || recordDates.length === 0) return 0;
 
-  // ✅ Сначала делаем запрос и сохраняем результат
-  const result = await supabase
-    .from('habits')
-    .select('id, title')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: true });
+  const today = getToday();
+  const dateSet = new Set(recordDates);
 
-  // ✅ Теперь извлекаем data и error
-  const { data, error } = result;
-  console.log("📊 Ответ от Supabase:", { data, error });
+  let current = today;
+  let streak = 0;
 
-  if (error) {
-    console.error('Ошибка загрузки привычек:', error);
-    return ctx.reply('❌ Не удалось загрузить привычки.');
+  while (dateSet.has(current)) {
+    streak++;
+    const d = new Date(current);
+    d.setDate(d.getDate() - 1);
+    current = d.toISOString().split('T')[0];
   }
 
-  if (!data || data.length === 0) {
-    return ctx.reply('У вас пока нет привычек. Сначала добавьте одну!');
-  }
+  return streak;
+}
 
-  const inlineKeyboard = data.map(habit => [
-    { text: habit.title, callback_data: `view_${habit.id}` },
-    { text: "✅ Отметить", callback_data: `mark_${habit.id}` }
-  ]);
-
-  await ctx.reply('Выберите привычку, которую хотите отметить на сегодня:', {
-    reply_markup: {
-      inline_keyboard: inlineKeyboard
-    }
-  });
+  bot.hears('Список привычек', async (ctx) => {
+  await sendHabitsList(ctx);
 });
-
+   
 
 
 bot.on("text", async (ctx) => {
@@ -117,7 +149,6 @@ bot.action(/mark_(.+)/, async (ctx) => {
   const habitId = ctx.match[1];
   const userId = ctx.from.id.toString();
   const today = getToday();
-  console.log("📅 Сегодняшняя дата (по серверу):", today);
 
   // Получаем привычку
   const { data: habitData, error: habitError } = await supabase
@@ -135,14 +166,12 @@ bot.action(/mark_(.+)/, async (ctx) => {
   const habit = habitData;
 
   // Проверяем, отмечена ли уже сегодня
-  const { data: existingRecord, error: existingError } = await supabase
+  const { data: existingRecord } = await supabase
     .from('habit_records')
     .select('id')
     .eq('habit_id', habitId)
     .eq('record_date', today)
     .maybeSingle();
-
-  console.log("🔍 Результат проверки отметки:", { existingRecord, existingError });
 
   if (existingRecord) {
     return ctx.answerCbQuery('✅ Уже отмечено сегодня!');
@@ -161,9 +190,9 @@ bot.action(/mark_(.+)/, async (ctx) => {
     console.error('Ошибка отметки:', insertError);
     return ctx.answerCbQuery('❌ Не удалось сохранить.');
   }
-
-  console.log(`[✓] ${userId} отметил "${habit.title}" на ${today}`);
-  return ctx.answerCbQuery(`✅ "${habit.title}" отмечено!`);
+  
+  await ctx.deleteMessage();
+  await sendHabitsList(ctx);
 });
 
 bot.launch();
